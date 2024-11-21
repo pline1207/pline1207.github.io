@@ -16,10 +16,67 @@
 <body>
   <h1>Python 코드: example.py</h1>
   <pre>
-def greet(name):
-    print(f"Hello, {name}!")
+import numpy as np
+from scipy.spatial import cKDTree
+import time
 
-greet("GitHub Pages")
+def read_vtk(fname):
+
+    with open(fname, "rb") as fd:
+        lines = iter(l for l in fd)
+
+        ver = next(d for d in lines if b"Version" in d)
+        ver = float(ver.split()[-1])
+        bin = next(d.strip() for d in lines if d.strip() in [b"ASCII", b"BINARY"]) == b"BINARY"
+        sep = "" if bin else " "
+
+        nVert = next(d for d in lines if b"POINTS" in d)
+        nVert = int(nVert.split()[1])
+        dtype = np.dtype(">f4") if bin else float
+        v = np.fromfile(fd, dtype=dtype, count=nVert * 3, sep=sep).reshape(nVert, 3)
+
+        nFace = next(d for d in lines if b"POLYGONS" in d)
+        nFace = int(nFace.split()[1])
+        if ver < 5:
+            dtype = np.dtype(">i4") if bin else int
+            f = np.fromfile(fd, dtype=dtype, count=nFace * 4, sep=sep).reshape(nFace, 4)
+            f = f[:, 1:]
+        else:
+            dtype = np.dtype(">i8") if bin else int
+            nFace -= 1
+            next(d for d in lines if b"CONNECTIVITY" in d)
+            f = np.fromfile(fd, dtype=dtype, count=nFace * 3, sep=sep).reshape(nFace, 3)
+
+    return v, f
+
+
+v, f = read_vtk("C:/Users/pline1207/Desktop/ico6.vtk")
+#v, f = read_vtk("C:/Users/pline1207/Desktop/Vtk_files/HLN-12-2.vnew.e1.vtk")
+tree = cKDTree(v)
   </pre>
+
+  <pre>
+def tri_search(v, f, fname):
+    # Read VTK file to get vertices and faces
+    v1, f1 = read_vtk(fname)
+
+    search = []
+    centroids = []
+    radii = []
+
+    centroids = np.mean(v1[f1], axis=1)
+    
+    dot1 = np.sum(centroids * v1[f1[:, 0], :], axis=1)
+    dot2 = np.sum(centroids * v1[f1[:, 1], :], axis=1)
+    dot3 = np.sum(centroids * v1[f1[:, 2], :], axis=1)
+
+    radii = np.array(np.arccos(np.minimum(np.array(dot1), np.minimum(np.array(dot2), np.array(dot3)))))
+    
+    centroids = np.array(centroids)
+    search = tree.query_ball_point(centroids, radii)
+
+    return search
+  </pre>
+  
 </body>
 </html>
