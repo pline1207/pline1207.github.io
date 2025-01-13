@@ -1,0 +1,681 @@
+from typing import Union, Tuple, List
+import sys
+import os
+
+from PIL import Image
+import numpy as np
+
+from torch import autocast, nn
+import torch
+from torch import distributed as dist
+from torchvision.utils import save_image, flow_to_image
+import torchvision.transforms as transforms
+
+from dynamic_network_architectures.building_blocks.helper import get_matching_batchnorm
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
+from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
+from nnunetv2.utilities.helpers import empty_cache, dummy_context
+from nnunetv2.utilities.collate_outputs import collate_outputs
+
+from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
+from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+from batchgenerators.utilities.file_and_folder_operations import join, load_json, isfile
+
+# from .......voxelmorph.voxelmorph.torch.networks import VxmDense
+
+# sys.path.append('/home/yykim/workspace/Deformable-nnUNet-dev/nnunetv2/training/nnUNetTrainer/variants/network_architecture')
+from ViT import Attention, VIT, MultiheadAttention
+
+# import voxelmorph with pytorch backend
+os.environ['NEURITE_BACKEND'] = 'pytorch'
+os.environ['VXM_BACKEND'] = 'pytorch'
+import voxelmorph as vxm
+
+import torch.nn.functional as F
+
+from torchviz import make_dot
+from torchsummary import summary
+
+from torch._dynamo import OptimizedModule
+
+# from .......CounterSynth.generator import SpatialTransformer
+
+
+class nnUNetTrainerVxMA_a(nnUNetTrainer):
+    def __init__(
+        self,
+        plans: dict,
+        configuration: str,
+        fold: int,
+        dataset_json: dict,
+        unpack_dataset: bool = True,
+        device: torch.device = torch.device("cuda"), 
+        verbose = False,
+    ):
+        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device, verbose)
+        self.enable_deep_supervision = False
+        
+
+    @staticmethod
+    def build_network_architecture(architecture_class_name: str,
+                                   arch_init_kwargs: dict,
+                                   arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+                                   num_input_channels: int,
+                                   num_output_channels: int,
+                                   enable_deep_supervision: bool = True,
+                                   verbose: bool = False,
+                                   ) -> nn.Module:
+
+        # TODO: 모델 구조 변경
+
+        # vxm unet architecture
+        # enc_nf = arch_init_kwargs['arch_init_kwargs'] if arch_init_kwargs['arch_init_kwargs'] else [16, 32, 32, 32]
+        # dec_nf = reversed(arch_init_kwargs['arch_init_kwargs']) if arch_init_kwargs['arch_init_kwargs'] else [32, 32, 32, 32, 32, 16, 16]
+        enc_nf = [16, 32, 32, 32]  # encoder
+        dec_nf = [32, 32, 32, 32, 32, 16, 16]  # decoder
+
+        inshape = [192, 160] # have to be changed (MET: [192, 160], Hippocampus: [dataset 참고])
+        bidir = False
+        int_steps=7
+        int_downsize=2
+
+        vxm_dense = vxm.networks.VxmDense(
+        inshape=inshape,
+        nb_unet_features=[enc_nf, dec_nf],
+        bidir=bidir,
+        int_steps=int_steps,
+        int_downsize=int_downsize,
+        src_feats = 4, # have to be changed (MET: 4, Hippocampus: 1)
+        trg_feats = 0
+        )
+
+        # Define the attention layer (tune hidden_dim as needed)
+        # att params
+        att_inshape = [i//2 for i in inshape]
+        patch_size = 16  # Patch size
+        in_chan = len(inshape)  # Number of input channels
+        attention_layer = Attention(att_inshape, patch_size, in_chan=in_chan)
+
+        network_from_plans = get_network_from_plans(
+            architecture_class_name,
+            arch_init_kwargs,
+            arch_init_kwargs_req_import,
+            num_input_channels,
+            num_output_channels,
+            allow_init=True,
+            deep_supervision=enable_deep_supervision)
+        
+        # Initialize the combined network
+        combined_network = CombinedNetwork(vxm_dense, attention_layer, network_from_plans, verbose)
+
+        return combined_network
+    
+
+    def save_checkpoint(self, filename: str) -> None:
+        if self.local_rank == 0:
+            if not self.disable_checkpointing:
+                if self.is_ddp:
+                    mod = self.network.module
+                else:
+                    mod = self.network
+                if isinstance(mod, OptimizedModule):
+                    mod = mod._orig_mod
+
+                checkpoint = {
+                    'network_weights': mod.state_dict(),
+                    'optimizer_state': self.optimizer.state_dict(),
+                    'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+                    'logging': self.logger.get_checkpoint(),
+                    '_best_ema': self._best_ema,
+                    'current_epoch': self.current_epoch + 1,
+                    'init_args': self.my_init_kwargs,
+                    'trainer_name': self.__class__.__name__,
+                    'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
+                }
+                torch.save(checkpoint, filename)
+                if self.verbose:
+                    self.save_intermediate_images(os.path.join(self.output_folder, "intermediate_images"))
+            else:
+                self.print_to_log_file('No checkpoint written, checkpointing is disabled')
+    
+    def save_intermediate_images(self, output_folder = None):
+        input, transposed_input, pos_flow, transposed_output, final_output, attention = self.network.get_intermediate_images()
+        target = self.target
+
+        # Assuming self.output_folder is where you want to save the images
+        if output_folder == None:
+            output_folder = os.path.join(self.output_folder, "intermediate_images")
+        
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Save input image
+        input_image = input[0].cpu()  # Assuming input is on GPU, move it to CPU for saving
+        save_image(input_image, os.path.join(output_folder, f'epoch_{self.current_epoch}_input.png'))
+
+        # Save transposed input image
+        transposed_input_image = transposed_input[0].cpu()  # Assuming transposed input is on GPU, move it to CPU for saving
+        save_image(transposed_input_image, os.path.join(output_folder, f'epoch_{self.current_epoch}_input_trans.png'))
+        
+        # Save pos_flow image
+        pos_flow_image = pos_flow[0].cpu()  # Assuming pos_flow is on GPU, move it to CPU for saving
+        # save_image(pos_flow_image, os.path.join(output_folder, f'epoch_{self.current_epoch}_pos_flow.png'))
+        save_image(pos_flow_image[0], os.path.join(output_folder, f'epoch_{self.current_epoch}_pos_flow_y.png'))
+        save_image(pos_flow_image[1], os.path.join(output_folder, f'epoch_{self.current_epoch}_pos_flow_x.png'))
+        
+        # Save transposed_output_image image
+        transposed_output_image = transposed_output[0].cpu()  # Assuming transposed_output is on GPU, move it to CPU for saving
+        save_image(transposed_output_image, os.path.join(output_folder, f'epoch_{self.current_epoch}_output_trans.png'))
+        
+        # Save final_output image
+        final_output_image = final_output[0].cpu()  # Assuming final_output is on GPU, move it to CPU for saving
+        save_image(final_output_image, os.path.join(output_folder, f'epoch_{self.current_epoch}_output_final.png'))
+        
+        # Save target image
+        target_image = target[0].cpu()  # Assuming target is on GPU, move it to CPU for saving
+        save_image(target_image, os.path.join(output_folder, f'epoch_{self.current_epoch}_target.png'))
+        
+        # Save attention image
+        attention_image = attention[0].cpu()  # Assuming attention is on GPU, move it to CPU for saving
+        save_image(attention_image, os.path.join(output_folder, f'epoch_{self.current_epoch}_attention.png'))
+
+    def _build_loss(self):
+        original_loss = super()._build_loss()
+        weights = [1, 0.2]
+        grad_loss = vxm.losses.Grad('l2').loss
+
+        loss = lambda x, y: weights[0] * original_loss(x, y) + weights[1] * grad_loss(x, y)
+        return loss
+    
+    # def validation_step(self, batch: dict) -> dict:
+    #     data = batch['data']
+    #     target = batch['target']
+
+    #     data = data.to(self.device, non_blocking=False)
+    #     if isinstance(target, list):
+    #         target = [i.to(self.device, non_blocking=False) for i in target]
+    #     else:
+    #         target = target.to(self.device, non_blocking=False)
+
+    #     # if self.verbose:
+    #     #     self.target = target
+
+    #     # Autocast can be annoying
+    #     # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
+    #     # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+    #     # So autocast will only be active if we have a cuda device.
+    #     with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+    #         output = self.network(data)
+    #         del data
+    #         l = self.loss(output, target)
+    #         # if self.verbose:
+    #         #     # calc deform loss
+    #         #     deformed_output = self.network.deformed_output
+                
+    #         #     # split_deformed_target = torch.split(target, 1, dim=1)
+    #         #     # deformed_target = []
+    #         #     # for split_target in split_deformed_target:
+    #         #     #     deformed_target.append(self.network.vxm_dense.transformer(split_target, self.network.pos_flow))
+    #         #     # deformed_target = torch.cat(deformed_target, dim=1)
+    #         #     deformed_target = self.network.vxm_dense.transformer(target, self.network.pos_flow)
+                
+    #         #     deformed_loss = self.loss(deformed_output, deformed_target)
+
+
+    #         #     # Calculate additional metrics
+    #         #     bce_kwargs = {}
+    #         #     soft_dice_kwargs = {'batch_dice': self.configuration_manager.batch_dice,
+    #         #                         'do_bg': True, 'smooth': 1e-5, 'ddp': self.is_ddp}
+
+    #         #     original_loss_fn = super()._build_loss()
+    #         #     bce_loss_fn = nn.BCEWithLogitsLoss(**bce_kwargs)
+    #         #     dice_loss_fn = MemoryEfficientSoftDiceLoss(apply_nonlin=torch.sigmoid, **soft_dice_kwargs)
+    #         #     l2_loss_fn = vxm.losses.Grad('l2').loss
+
+    #         #     original_loss = original_loss_fn(output, target)
+    #         #     bce_loss = bce_loss_fn(output, target)
+    #         #     dice_loss = dice_loss_fn(output, target)
+    #         #     l2_loss = l2_loss_fn(output, target)
+
+    #         #     original_deformed_loss = original_loss_fn(deformed_output, deformed_target)
+    #         #     bce_deformed_loss = bce_loss_fn(deformed_output, deformed_target)
+    #         #     dice_deformed_loss = dice_loss_fn(deformed_output, deformed_target)
+    #         #     l2_deformed_loss = l2_loss_fn(deformed_output, deformed_target)
+
+    #     # we only need the output with the highest output resolution (if DS enabled)
+    #     if self.enable_deep_supervision:
+    #         output = output[0]
+    #         target = target[0]
+
+    #     # the following is needed for online evaluation. Fake dice (green line)
+    #     axes = [0] + list(range(2, output.ndim))
+
+    #     if self.label_manager.has_regions:
+    #         predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
+    #     else:
+    #         # no need for softmax
+    #         output_seg = output.argmax(1)[:, None]
+    #         predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
+    #         predicted_segmentation_onehot.scatter_(1, output_seg, 1)
+    #         del output_seg
+
+    #     if self.label_manager.has_ignore_label:
+    #         if not self.label_manager.has_regions:
+    #             mask = (target != self.label_manager.ignore_label).float()
+    #             # CAREFUL that you don't rely on target after this line!
+    #             target[target == self.label_manager.ignore_label] = 0
+    #         else:
+    #             mask = 1 - target[:, -1:]
+    #             # CAREFUL that you don't rely on target after this line!
+    #             target = target[:, :-1]
+    #     else:
+    #         mask = None
+
+    #     tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
+
+    #     tp_hard = tp.detach().cpu().numpy()
+    #     fp_hard = fp.detach().cpu().numpy()
+    #     fn_hard = fn.detach().cpu().numpy()
+    #     if not self.label_manager.has_regions:
+    #         # if we train with regions all segmentation heads predict some kind of foreground. In conventional
+    #         # (softmax training) there needs tobe one output for the background. We are not interested in the
+    #         # background Dice
+    #         # [1:] in order to remove background
+    #         tp_hard = tp_hard[1:]
+    #         fp_hard = fp_hard[1:]
+    #         fn_hard = fn_hard[1:]
+
+    #     result = {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+    #     # if self.verbose:
+    #     #     result.update({
+    #     #         'deformed_loss': deformed_loss.detach().cpu().numpy(),
+    #     #         'original_loss': original_loss.detach().cpu().numpy(),
+    #     #         'bce_loss': bce_loss.detach().cpu().numpy(),
+    #     #         'dice_loss': dice_loss.detach().cpu().numpy(),
+    #     #         'l2_loss': l2_loss.detach().cpu().numpy(),
+    #     #         'original_deformed_loss': original_deformed_loss.detach().cpu().numpy(),
+    #     #         'bce_deformed_loss': bce_deformed_loss.detach().cpu().numpy(),
+    #     #         'dice_deformed_loss': dice_deformed_loss.detach().cpu().numpy(),
+    #     #         'l2_deformed_loss': l2_deformed_loss.detach().cpu().numpy(),
+    #     #     })
+
+    #     return result
+
+
+    # def on_validation_epoch_end(self, val_outputs: List[dict]):
+    #     outputs_collated = collate_outputs(val_outputs)
+    #     tp = np.sum(outputs_collated['tp_hard'], 0)
+    #     fp = np.sum(outputs_collated['fp_hard'], 0)
+    #     fn = np.sum(outputs_collated['fn_hard'], 0)
+
+    #     if self.is_ddp:
+    #         world_size = dist.get_world_size()
+
+    #         tps = [None for _ in range(world_size)]
+    #         dist.all_gather_object(tps, tp)
+    #         tp = np.vstack([i[None] for i in tps]).sum(0)
+
+    #         fps = [None for _ in range(world_size)]
+    #         dist.all_gather_object(fps, fp)
+    #         fp = np.vstack([i[None] for i in fps]).sum(0)
+
+    #         fns = [None for _ in range(world_size)]
+    #         dist.all_gather_object(fns, fn)
+    #         fn = np.vstack([i[None] for i in fns]).sum(0)
+
+    #         losses_val = [None for _ in range(world_size)]
+    #         dist.all_gather_object(losses_val, outputs_collated['loss'])
+    #         loss_here = np.vstack(losses_val).mean()
+    #     else:
+    #         loss_here = np.mean(outputs_collated['loss'])
+        
+    #     # if self.verbose:
+    #     #     # Calculate means of losses
+    #     #     deformed_loss_here = np.mean(outputs_collated['deformed_loss'])
+    #     #     original_loss_here = np.mean(outputs_collated['original_loss'])
+    #     #     bce_loss_here = np.mean(outputs_collated['bce_loss'])
+    #     #     dice_loss_here = np.mean(outputs_collated['dice_loss'])
+    #     #     l2_loss_here = np.mean(outputs_collated['l2_loss'])
+    #     #     original_deformed_loss_here = np.mean(outputs_collated['original_deformed_loss'])
+    #     #     bce_deformed_loss_here = np.mean(outputs_collated['bce_deformed_loss'])
+    #     #     dice_deformed_loss_here = np.mean(outputs_collated['dice_deformed_loss'])
+    #     #     l2_deformed_loss_here = np.mean(outputs_collated['l2_deformed_loss'])
+
+    #     #     # Log the calculated means
+    #     #     self.logger.log('deformed_val_losses', deformed_loss_here, self.current_epoch)
+    #     #     self.logger.log('original_loss', original_loss_here, self.current_epoch)
+    #     #     self.logger.log('bce_loss', bce_loss_here, self.current_epoch)
+    #     #     self.logger.log('dice_loss', dice_loss_here, self.current_epoch)
+    #     #     self.logger.log('l2_loss', l2_loss_here, self.current_epoch)
+    #     #     self.logger.log('original_deformed_loss', original_deformed_loss_here, self.current_epoch)
+    #     #     self.logger.log('bce_deformed_loss', bce_deformed_loss_here, self.current_epoch)
+    #     #     self.logger.log('dice_deformed_loss', dice_deformed_loss_here, self.current_epoch)
+    #     #     self.logger.log('l2_deformed_loss', l2_deformed_loss_here, self.current_epoch)
+
+    #     global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
+    #     mean_fg_dice = np.nanmean(global_dc_per_class)
+    #     self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
+    #     self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
+    #     self.logger.log('val_losses', loss_here, self.current_epoch)
+
+
+class CombinedNetwork(nn.Module):
+    def __init__(self, vxm_dense, attention_network, network_from_plans, verbose = False):
+        super(CombinedNetwork, self).__init__()
+
+        # Dynamically copy all attributes from network_from_plans to CombinedNetwork
+        # 스택 너무많이 쌓였다 오류 나서 없앰, 필요한것만 따로 선언하자.
+        # for attr_name in dir(network_from_plans):
+        #     attr_value = getattr(network_from_plans, attr_name)
+        #     if not attr_name.startswith("_") and not callable(attr_value): # not attr_name.startswith("__")
+        #         setattr(self, attr_name, attr_value)
+        self.vxm_dense = vxm_dense
+        self.attention_network = attention_network
+        self.network_from_plans = network_from_plans
+        
+        self.decoder = network_from_plans.decoder
+
+        self.verbose = verbose
+
+        self.y_source = self.pos_flow = self.predicted_output = self.final_output = None
+        
+        # # 채널수 조정
+        # vxm_output_channels = vxm_dense.unet_model.final_nf  # Output channels from VxmDense
+        # network_input_channels = self._get_first_layer_input_channels(network_from_plans)
+        
+        # if vxm_output_channels != network_input_channels:
+        #     self.channel_adjust = nn.Conv2d(vxm_output_channels, network_input_channels, kernel_size=1)
+        # else:
+        #     self.channel_adjust = nn.Identity()
+
+    def forward(self, source):
+        # Pass the source through VxmDense
+        vxm_output = self.vxm_dense(source, registration=False)
+
+        # vxm_output is a tuple (y_source, pos_flow) when registration=True
+        y_source, pos_flow = vxm_output # pos_flow로 transform된 y_source
+
+        # Apply attention to the pos_flow
+        multihead_image, attention = self.attention_network(pos_flow)
+        normalized_attention = (multihead_image - torch.min(multihead_image)) / (torch.max(multihead_image) - torch.min(multihead_image))
+        # pos_flow의 절대값에 multihead_image를 더함
+        modified_pos_flow = torch.abs(pos_flow) + multihead_image
+
+        # 기존 pos_flow의 부호 저장
+        sign_pos_flow = torch.sign(pos_flow)
+
+        # 추가 후 음수로 변한 값을 부호 반대로 변경
+        attended_pos_flow = modified_pos_flow * sign_pos_flow
+
+        attended_pos_flow = self.vxm_dense.fullsize(attended_pos_flow)
+
+        # Use the attended flow to deform the source image
+        deformed_source=self.vxm_dense.transformer(source, attended_pos_flow)
+
+        # Pass the output of VxmDense through the other network
+        if isinstance(deformed_source, tuple):
+            deformed_source = deformed_source[0]
+        predicted_output = self.network_from_plans(deformed_source)
+
+        # 아마 여기에 flow로 되돌리는 코드 넣어야 할지도
+        neg_flow = -attended_pos_flow
+        final_output = self.vxm_dense.transformer(predicted_output, neg_flow)
+
+        if self.verbose:
+            self.source = source
+            self.y_source = deformed_source
+            self.pos_flow = attended_pos_flow
+            self.deformed_output = predicted_output
+            self.predicted_output = predicted_output
+            self.final_output = final_output
+            self.attention = multihead_image
+            # self.save_intermediate_images(y_source, pos_flow, predicted_output, final_output)
+        return final_output
+
+    def get_intermediate_images(self):
+        # source, deformed_source, pos_flow, deformed_output, final_output
+        return self.source, self.y_source, self.pos_flow, self.deformed_output, self.final_output, self.attention
+
+if __name__ == '__main__':
+    # vxm params
+    # Example usage:
+    # Define the input shape and other parameters for VxmDense
+    enc_nf = [16, 32, 32, 32]
+    dec_nf = [32, 32, 32, 32, 32, 16, 16]
+
+    # inshape = (192, 192, 192)
+    inshape = [192, 160]
+    bidir = False
+    int_steps=7
+    int_downsize=2
+
+    vxm_dense = vxm.networks.VxmDense(
+    inshape=inshape,
+    nb_unet_features=[enc_nf, dec_nf],
+    bidir=bidir,
+    int_steps=int_steps,
+    int_downsize=int_downsize,
+    src_feats = 4,
+    trg_feats = 0
+    )
+
+    # att params
+    # do 80 when using dataset 139
+    att_inshape = [96, 80]
+    patch_size = 16  # Patch size
+    in_chan = len(inshape)  # Number of input channels
+    attention_layer = MultiheadAttention(att_inshape, patch_size, in_chan=in_chan)
+    
+    # Assuming get_network_from_plans function and required parameters are available
+    arch_init_kwargs = dict({
+                    "n_stages": 6,
+                    "features_per_stage": [
+                        32,
+                        64,
+                        128,
+                        256,
+                        512,
+                        512
+                    ],
+                    "conv_op": "torch.nn.modules.conv.Conv2d",
+                    "kernel_sizes": [
+                        [
+                            3,
+                            3
+                        ],
+                        [
+                            3,
+                            3
+                        ],
+                        [
+                            3,
+                            3
+                        ],
+                        [
+                            3,
+                            3
+                        ],
+                        [
+                            3,
+                            3
+                        ],
+                        [
+                            3,
+                            3
+                        ]
+                    ],
+                    "strides": [
+                        [
+                            1,
+                            1
+                        ],
+                        [
+                            2,
+                            2
+                        ],
+                        [
+                            2,
+                            2
+                        ],
+                        [
+                            2,
+                            2
+                        ],
+                        [
+                            2,
+                            2
+                        ],
+                        [
+                            2,
+                            2
+                        ]
+                    ],
+                    "n_conv_per_stage": [
+                        2,
+                        2,
+                        2,
+                        2,
+                        2,
+                        2
+                    ],
+                    "n_conv_per_stage_decoder": [
+                        2,
+                        2,
+                        2,
+                        2,
+                        2
+                    ],
+                    "conv_bias": True,
+                    "norm_op": "torch.nn.modules.instancenorm.InstanceNorm2d",
+                    "norm_op_kwargs": {
+                        "eps": 1e-05,
+                        "affine": True
+                    },
+                    "dropout_op": None,
+                    "dropout_op_kwargs": None,
+                    "nonlin": "torch.nn.LeakyReLU",
+                    "nonlin_kwargs": {
+                        "inplace": True
+                    }})
+    network_from_plans = get_network_from_plans(
+            arch_class_name = "dynamic_network_architectures.architectures.unet.PlainConvUNet",
+            arch_kwargs = arch_init_kwargs,
+            arch_kwargs_req_import = [
+                    "conv_op",
+                    "norm_op",
+                    "dropout_op",
+                    "nonlin"
+                ],
+            input_channels = 4,
+            output_channels = 3,
+            allow_init=True,
+            deep_supervision=True)
+
+    # Initialize the combined network
+    combined_network = CombinedNetwork(vxm_dense, attention_layer, network_from_plans, verbose=True)
+
+    # Define the file path for loading and saving
+    fold=0
+    epoch = 19
+    
+    LOAD=True
+    if LOAD == True:
+        folder_path = f'/home/yykim/workspace/nnUNet_env/nnUNet_results/Dataset139_BraTS2023MET/nnUNetTrainerVxM__nnUNetPlans__2d/fold_{fold}/intermediate_images'
+        image_file_path = os.path.join(folder_path, f"epoch_{epoch}_input.png")
+        # flow_x_file_path = os.path.join(folder_path, f"epoch_{epoch}_pos_flow_x.png")
+        # flow_y_file_path = os.path.join(folder_path, f"epoch_{epoch}_pos_flow_y.png")
+
+
+        # source
+        # Load the image
+        sources = Image.open(image_file_path)
+        # Convert the image to a tensor
+        transform = transforms.ToTensor()
+        sources = transform(sources).unsqueeze(0)  # Add batch dimension
+
+        print(sources.shape)
+
+        # # pos flow
+
+        # # 이미지에서 불러오기
+        # transform = transforms.ToTensor()
+        # pos_flow_x_image = Image.open(flow_x_file_path).convert('L')
+        # pos_flow_x_image = transform(pos_flow_x_image)
+        # pos_flow_y_image = Image.open(flow_y_file_path).convert('L')
+        # pos_flow_y_image = transform(pos_flow_y_image)
+
+        # pos_flow = torch.stack([pos_flow_x_image, pos_flow_y_image], dim=1)
+        # print(pos_flow.shape)
+    else:
+        # Define example source tensor
+        # sources = torch.cat([torch.randn(1, 1, *inshape), torch.randn(1, 1, *inshape), torch.randn(1, 1, *inshape), torch.randn(1, 1, *inshape)], dim=1)
+
+        # White grid
+        sources = torch.zeros(1, 4, *inshape)
+        # Set every 10th pixel to 255
+        for i in range(0, inshape[0], 10):
+            sources[:, :, i, :] = 255
+        for j in range(0, inshape[1], 10):
+            sources[:, :, :, j] = 255
+
+        # pos flow
+        # random 값 생성
+        # pos_flow = torch.cat([torch.randn(1, *inshape), torch.randn(1, *inshape)]).unsqueeze(0)
+        # print(pos_flow.shape)
+
+    # Forward pass through the combined network
+    output = combined_network(sources)
+    print(output.shape)
+
+    source, deformed_source, pos_flow, deformed_output, final_output, attention = combined_network.get_intermediate_images()
+
+
+    # save in/output images
+    # output_folder=""
+    output_folder = f"/home/yykim/workspace/nnUNet/unit_test/grid_transform/fold_{fold}_epoch_{epoch}_grid"
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Save source image
+    source_image = sources[0].cpu()  # Assuming source is on GPU, move it to CPU for saving
+    save_image(source_image, os.path.join(output_folder, f'source.png'))
+    # Save deformed source image
+    deformed_source_image = deformed_source[0].cpu()  # Assuming source is on GPU, move it to CPU for saving
+    save_image(deformed_source_image, os.path.join(output_folder, f'deformed_source.png'))
+    # Save target image
+    target_image = output[0].cpu()  # Assuming target is on GPU, move it to CPU for saving
+    save_image(target_image, os.path.join(output_folder, f'target.png'))
+
+    # save_image test
+    # output_folder = f"/home/yykim/workspace/nnUNet/unit_test/grid_transform/rand_x_y"
+    os.makedirs(output_folder, exist_ok=True)
+
+    
+
+    pos_flow_image = pos_flow[0].cpu()
+    save_image(pos_flow_image[0], os.path.join(output_folder, "pos_flow_y.png")) # 정규화되어서 시각화됨, 큰 숫자가 흰색, 작은 숫자가 검은색
+    save_image(pos_flow_image[1], os.path.join(output_folder, "pos_flow_x.png"))
+    # pos_flow_image = flow_to_image(pos_flow[0].cpu())
+    # save_image(pos_flow_image, os.path.join(output_folder, "pos_flow.png"))
+
+
+    
+    transform_test = False
+    if transform_test:
+        # transform, neg transform 후 원상태로 돌아오는지 test
+        input_image = sources[0].cpu()  # Assuming transposed input is on GPU, move it to CPU for saving
+        save_image(sources, os.path.join(output_folder, "input_image.png"))
+
+        transposed_input = combined_network.vxm_dense.transformer(sources, pos_flow)
+        transposed_input_image = transposed_input[0].cpu()  # Assuming transposed input is on GPU, move it to CPU for saving
+        save_image(transposed_input_image, os.path.join(output_folder, "transposed_input_image.png"))
+
+        # pos_flow = combined_network.vxm_dense.fullsize(pos_flow)
+        neg_flow = -pos_flow/5
+        neg_transposed_input = combined_network.vxm_dense.transformer(sources, neg_flow)
+        neg_transposed_input_image = neg_transposed_input[0].cpu()  # Assuming transposed input is on GPU, move it to CPU for saving
+        save_image(neg_transposed_input_image, os.path.join(output_folder, "neg_transposed_input_image.png"))
+
+    # save model image
+    # make_dot(output, params=dict(combined_network.named_parameters())).render("combined_network", format="png")
+
+    # summary(combined_network, (1, 4, 190, 160))
